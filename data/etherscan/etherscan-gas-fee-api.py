@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 
-# Etherscan API key 
+# Etherscan API key (Send me a message or make your own on etherscan, Anej Rozman)
 API_KEY = "private"
 
 end_date = datetime.today()
