@@ -34,13 +34,13 @@ class UniswapV3LPGymEnv(gym.Env):
         )
 
         self.current_time_index = 0
-        self.prev_state = None
+        # Instead of a prev_state, we store the last timestamp we processed.
+        self.last_timestamp = None
         self.cumulative_pnl = 0.0
 
     def load_data(self):
-
-        self.uniswap_lp_data_1 = pd.read_csv("data/uniswap/uniswap_lp_data_1.csv")
-        self.uniswap_lp_data_1['timestamp'] = pd.to_datetime(self.uniswap_lp_data_1['timestamp'], unit='s')
+        self.uniswap_lp_data = pd.read_csv("data/uniswap/uniswap_lp_data_1.csv")
+        self.uniswap_lp_data['timestamp'] = pd.to_datetime(self.uniswap_lp_data['timestamp'], unit='s')
 
         # Load Binance futures and spot data. For these, we'll assume open_time is already in a string format.
         self.binance_futures_data = pd.read_csv(
@@ -53,48 +53,42 @@ class UniswapV3LPGymEnv(gym.Env):
         )
 
     def initialize_decision_grid(self):
-
-        start_dt = self.uniswap_lp_data_1['timestamp'].min()
-        end_dt = self.uniswap_lp_data_1['timestamp'].max()
+        start_dt = self.uniswap_lp_data['timestamp'].min()
+        end_dt = self.uniswap_lp_data['timestamp'].max()
         self.decision_grid = pd.date_range(start=start_dt, end=end_dt, freq='1min')
 
-    def get_state_at_time(self, query_timestamp):
+    def form_observable_data(self, timestamp):
+        binance_futures_seen = self.binance_futures_data[self.binance_futures_data['open_time'] <= timestamp]
+        if binance_futures_seen.empty:
+            raise ValueError(f"No binance_futures data available up to timestamp {timestamp}")
+        binance_spot_data = self.binance_spot_data[self.binance_spot_data['open_time'] <= timestamp]
+        if binance_spot_data.empty:
+            raise ValueError(f"No binance_spot data available up to timestamp {timestamp}")
+        uniswap_lp_data = self.uniswap_lp_data[self.uniswap_lp_data['timestamp'] <= timestamp]
+        if uniswap_lp_data.empty:
+            raise ValueError(f"No uniswap_lp_data available up to timestamp {timestamp}")
 
-        available_rows = self.uniswap_lp_data_1[self.uniswap_lp_data_1['timestamp'] <= query_timestamp]
-        if available_rows.empty:
-            raise ValueError(f"No Uniswap data available up to timestamp {query_timestamp}")
-        latest_row = available_rows.iloc[-1]
-        return latest_row.to_dict()
+        return (binance_futures_seen, binance_spot_data, uniswap_lp_data)
 
     def form_observable_features(self, timestamp):
-
-        state = self.get_state_at_time(timestamp)
-        # we fill in this list
         features = np.zeros(self.FEAT_NUM, dtype=np.float32)
-        
-        # placeholder
-        sqrtPriceX96 = state.get("sqrtPriceX96", None)
-        if sqrtPriceX96 is not None:
 
-            price = (float(sqrtPriceX96) / (2 ** 96)) ** 2
-            features[0] = price
+        (binance_futures_seen, binance_spot_data, uniswap_lp_data) = self.form_observable_data(timestamp)
         
+        ## Here you would fill in the features array appropriately based on the data
         return features
 
-    def compute_pnl(self, prev_state, current_state, action):
-
-        sqrtPrice_current = current_state.get("sqrtPriceX96", None)
-        if sqrtPrice_current is not None:
-            price = (float(sqrtPrice_current) / (2 ** 96)) ** 2
-        else:
-            price = 0
-
-        token0_balance_diff = float(current_state.get("token0_balance", 0)) - float(prev_state.get("token0_balance", 0))
-        token1_balance_diff = float(current_state.get("token1_balance", 0)) - float(prev_state.get("token1_balance", 0))
-
-        pnl = token0_balance_diff * price + token1_balance_diff
-
-        return pnl
+    def compute_pnl(self, current_timestamp, action):
+        """
+        Placeholder for PnL computation.
+        Use self.last_timestamp and current_timestamp to query the data between timesteps
+        and compute the pnl difference based on the action taken.
+        """
+        # Example (to be implemented):
+        # previous_data = self.form_observable_data(self.last_timestamp)
+        # current_data = self.form_observable_data(current_timestamp)
+        # pnl = ... compute pnl based on the difference between current_data and previous_data ...
+        return np.random.normal(0, 1)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -103,25 +97,27 @@ class UniswapV3LPGymEnv(gym.Env):
         max_start = total_decisions - self.episode_length
 
         self.current_time_index = np.random.randint(0, max_start + 1)
-        self.start_index = self.current_time_index
-
+        # Set last_timestamp for reference in pnl computation.
         current_timestamp = self.decision_grid[self.current_time_index]
-        self.prev_state = self.get_state_at_time(current_timestamp)
+        self.last_timestamp = current_timestamp
         self.cumulative_pnl = 0.0
 
         observable_features = self.form_observable_features(current_timestamp)
         return observable_features, {}
 
     def step(self, action):
-        
-        current_timestamp = self.decision_grid[self.current_time_index]
-        current_state = self.get_state_at_time(current_timestamp)
-        if self.prev_state is None:
-            self.prev_state = current_state
+        # The previous timestamp is stored in self.last_timestamp.
+        prev_timestamp = self.last_timestamp
 
-        pnl = self.compute_pnl(self.prev_state, current_state, action)
+        # Update to the current timestep based on the decision grid.
+        current_timestamp = self.decision_grid[self.current_time_index]
+        
+        # Compute pnl by comparing data between prev_timestamp and current_timestamp
+        pnl = self.compute_pnl(current_timestamp, action)
         self.cumulative_pnl += pnl
-        self.prev_state = current_state
+        
+        # Update last_timestamp to the current one so that next step can refer to it
+        self.last_timestamp = current_timestamp
 
         self.current_time_index += 1
         done = self.current_time_index >= len(self.decision_grid)
@@ -133,7 +129,6 @@ class UniswapV3LPGymEnv(gym.Env):
         return next_observation, pnl, done, False, {}
 
     def render(self, mode="human"):
-
         print(f"Time Index: {self.current_time_index}, Cumulative PnL: {self.cumulative_pnl}")
 
     def close(self):
