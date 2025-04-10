@@ -34,7 +34,6 @@ class UniswapV3LPGymEnv(gym.Env):
         )
 
         self.current_time_index = 0
-        # Instead of a prev_state, we store the last timestamp we processed.
         self.last_timestamp = None
         self.cumulative_pnl = 0.0
 
@@ -58,33 +57,34 @@ class UniswapV3LPGymEnv(gym.Env):
         self.decision_grid = pd.date_range(start=start_dt, end=end_dt, freq='1min')
 
     def form_observable_data(self, timestamp):
-        binance_futures_seen = self.binance_futures_data[self.binance_futures_data['open_time'] <= timestamp]
-        if binance_futures_seen.empty:
+        binance_futures = self.binance_futures_data[self.binance_futures_data['open_time'] <= timestamp]
+        if binance_futures.empty:
             raise ValueError(f"No binance_futures data available up to timestamp {timestamp}")
-        binance_spot_data = self.binance_spot_data[self.binance_spot_data['open_time'] <= timestamp]
-        if binance_spot_data.empty:
+        binance_spot = self.binance_spot_data[self.binance_spot_data['open_time'] <= timestamp]
+        if binance_spot.empty:
             raise ValueError(f"No binance_spot data available up to timestamp {timestamp}")
-        uniswap_lp_data = self.uniswap_lp_data[self.uniswap_lp_data['timestamp'] <= timestamp]
-        if uniswap_lp_data.empty:
+        uniswap_lp = self.uniswap_lp_data[self.uniswap_lp_data['timestamp'] <= timestamp]
+        if uniswap_lp.empty:
             raise ValueError(f"No uniswap_lp_data available up to timestamp {timestamp}")
 
-        return (binance_futures_seen, binance_spot_data, uniswap_lp_data)
+        return (binance_futures, binance_spot, uniswap_lp)
 
     def form_observable_features(self, timestamp):
         features = np.zeros(self.FEAT_NUM, dtype=np.float32)
 
-        (binance_futures_seen, binance_spot_data, uniswap_lp_data) = self.form_observable_data(timestamp)
+        (binance_futures, binance_spot, uniswap_lp) = self.form_observable_data(timestamp)
         
-        ## Here you would fill in the features array appropriately based on the data
+        ## now code which takes existing data and fills in features data
+        ## e.g.
+        features[0] = np.log(binance_futures.close.iloc[-1] / binance_futures.close.iloc[-1])
+        features[1] = 3
         return features
 
     def compute_pnl(self, current_timestamp, action):
         """
         Placeholder for PnL computation.
-        Use self.last_timestamp and current_timestamp to query the data between timesteps
-        and compute the pnl difference based on the action taken.
         """
-        # Example (to be implemented):
+
         # previous_data = self.form_observable_data(self.last_timestamp)
         # current_data = self.form_observable_data(current_timestamp)
         # pnl = ... compute pnl based on the difference between current_data and previous_data ...
@@ -97,7 +97,7 @@ class UniswapV3LPGymEnv(gym.Env):
         max_start = total_decisions - self.episode_length
 
         self.current_time_index = np.random.randint(0, max_start + 1)
-        # Set last_timestamp for reference in pnl computation.
+
         current_timestamp = self.decision_grid[self.current_time_index]
         self.last_timestamp = current_timestamp
         self.cumulative_pnl = 0.0
@@ -106,17 +106,13 @@ class UniswapV3LPGymEnv(gym.Env):
         return observable_features, {}
 
     def step(self, action):
-        # The previous timestamp is stored in self.last_timestamp.
-        prev_timestamp = self.last_timestamp
 
-        # Update to the current timestep based on the decision grid.
+        prev_timestamp = self.last_timestamp
         current_timestamp = self.decision_grid[self.current_time_index]
         
-        # Compute pnl by comparing data between prev_timestamp and current_timestamp
         pnl = self.compute_pnl(current_timestamp, action)
         self.cumulative_pnl += pnl
         
-        # Update last_timestamp to the current one so that next step can refer to it
         self.last_timestamp = current_timestamp
 
         self.current_time_index += 1
