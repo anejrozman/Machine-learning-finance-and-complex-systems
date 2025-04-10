@@ -169,3 +169,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Large files (to be manually imported by the user)
+uniswap_lp_data
