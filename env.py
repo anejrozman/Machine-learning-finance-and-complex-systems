@@ -38,7 +38,7 @@ class UniswapV3LPGymEnv(gym.Env):
         self.cumulative_pnl = 0.0
 
     def load_data(self):
-        self.uniswap_lp_data = pd.read_csv("data/uniswap/uniswap_lp_data_1.csv")
+        self.uniswap_lp_data = pd.read_csv("/Users/macbook/Desktop/merged_uniswap_data.csv")
         self.uniswap_lp_data['timestamp'] = pd.to_datetime(self.uniswap_lp_data['timestamp'], unit='s')
 
         # Load Binance futures and spot data. For these, we'll assume open_time is already in a string format.
@@ -56,28 +56,33 @@ class UniswapV3LPGymEnv(gym.Env):
         end_dt = self.uniswap_lp_data['timestamp'].max()
         self.decision_grid = pd.date_range(start=start_dt, end=end_dt, freq='1min')
 
-    def form_observable_data(self, timestamp):
-        binance_futures = self.binance_futures_data[self.binance_futures_data['open_time'] <= timestamp]
+    def form_observable_data(self, timestamp, beginning):
+        binance_futures = self.binance_futures_data[self.binance_futures_data['open_time'] <= timestamp & self.binance_futures_data['open_time'] >= beginning]
         if binance_futures.empty:
             raise ValueError(f"No binance_futures data available up to timestamp {timestamp}")
-        binance_spot = self.binance_spot_data[self.binance_spot_data['open_time'] <= timestamp]
+        binance_spot = self.binance_spot_data[self.binance_spot_data['open_time'] <= timestamp & self.binance_spot_data['open_time'] >= beginning]
         if binance_spot.empty:
             raise ValueError(f"No binance_spot data available up to timestamp {timestamp}")
-        uniswap_lp = self.uniswap_lp_data[self.uniswap_lp_data['timestamp'] <= timestamp]
+        uniswap_lp = self.uniswap_lp_data[self.uniswap_lp_data['timestamp'] <= timestamp & self.uniswap_lp_data['timestamp'] >= beginning]
         if uniswap_lp.empty:
             raise ValueError(f"No uniswap_lp_data available up to timestamp {timestamp}")
 
         return (binance_futures, binance_spot, uniswap_lp)
 
-    def form_observable_features(self, timestamp):
+    def form_observable_features(self, timestamp, lookback_period = pd.Timedelta(1, "hour")):
         features = np.zeros(self.FEAT_NUM, dtype=np.float32)
-
-        (binance_futures, binance_spot, uniswap_lp) = self.form_observable_data(timestamp)
+        beginning = timestamp - lookback_period
+        (binance_futures, binance_spot, uniswap_lp) = self.form_observable_data(timestamp, beginning)
         
         ## now code which takes existing data and fills in features data
         ## e.g.
         features[0] = np.log(binance_futures.close.iloc[-1] / binance_futures.close.iloc[-1])
-        features[1] = 3
+        price = (uniswap_lp['sqrtPriceX96']/ 2**96)**2
+        features[1] = np.std(price) # volatility
+        features[2] = price[1:] - price[:-1] # price trend
+        features[3] = np.mean(uniswap_lp['gas_eth']) # average gas fees (all events combined for now)
+        features[4] = np.mean(uniswap_lp['liquidity']) / 2**96 # liquidity
+        
         return features
 
     def compute_pnl(self, current_timestamp, action):
