@@ -22,6 +22,7 @@ class UniswapV3LPGymEnv(gym.Env):
         self.wealth = None # It is set during the reset function, pd.Series with one obs. 
         self.tau = self.config.TAU
         self.FEAT_NUM = feat_num
+        self.prev_action = np.array([0, 0, 0])
 
         self.load_data()
         self.initialize_decision_grid()
@@ -225,9 +226,9 @@ class UniswapV3LPGymEnv(gym.Env):
         """
 
         # Previous decision 
-        previous_action = history[0]
-        previous_lower_tick = history[1]
-        previous_upper_tick = history[2]
+        previous_action = self.prev_action[0]
+        previous_lower_tick = self.prev_action[1]
+        previous_upper_tick = self.prev_action[2]
 
         next_action = action[0]
         next_lower_tick = action[1]
@@ -269,7 +270,7 @@ class UniswapV3LPGymEnv(gym.Env):
         self.current_time_index = np.random.randint(0, max_start + 1)
 
         self.wealth = pd.Series([self.initial_wealth], 
-                                index=self.decision_grid[self.current_time_index])
+                                index=[self.decision_grid[self.current_time_index]])
 
 
         current_timestamp = self.decision_grid[self.current_time_index]
@@ -297,6 +298,7 @@ class UniswapV3LPGymEnv(gym.Env):
             new_s = pd.Series([self.wealth.iloc[-1] + pnl], index=[next_timestamp])
             self.wealth = pd.concat([self.wealth, new_s])
             next_observation = self.form_observable_features(next_timestamp)
+            self.prev_action = action
 
         return next_observation, pnl, done, False, {}
 
