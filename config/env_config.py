@@ -9,8 +9,8 @@ import os
 
 @dataclass
 class Config:
-    WEALTH: float = field(default=1000.0, metadata={"docs": "Initial wealth for the liquidity provider."})
-    TAU: float = field(default=0.003, metadata={"docs": "Proportional fee (swap fee) of the pool."})
+    WEALTH: float = field(default=1.0, metadata={"docs": "Initial wealth for the liquidity provider."})
+    # TAU: float = field(default=0.003, metadata={"docs": "Proportional fee (swap fee) of the pool."})
     PATH_FAKE_DATA: Path = field(
         default=Path(__file__).resolve().parents[1] / "data" / "fake_data",
         metadata={"docs": "Relative path to the fake data folder"}
