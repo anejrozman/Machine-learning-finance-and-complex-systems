@@ -13,22 +13,18 @@ LVR - gas fees + collected fees
 """
 
 
-
 ###############################################
 # Constants & Paths
 ###############################################
-UNISWAP_POOL_EVENTS_PATH = "uniswap_lp_data"  # folder with all on‑chain CSVs
+UNISWAP_POOL_EVENTS_PATH = "uniswap_lp_data"  # folder with all on-chain CSVs
 ETH_USDC_PRICE_PATH = "data/binance/price_data/coinUSDC-price-data/ETHUSDC_20250316.csv"
 UNISWAP_SAMPLE_PATH = "data/uniswap/uniswap_lp_data_1.csv"
-FEE_TABLE_PATH = "data/uniswap/fee_table.parquet"   # pre‑computed minute fee grid
-POOL_FEE_TIER = 0.0005   # 5 bp → change if you use a 0.3 % or 0.01 % pool
+FEE_TABLE_PATH = "data/uniswap/fee_table.parquet"   # pre-computed minute fee grid
+POOL_FEE_TIER = 0.0005   # 5 bp 
 
-################################################
-# Helper functions
-################################################
 
 def ticks_to_sqrtp(tick: int) -> float:
-    """Convert a Uniswap‑V3 tick index to √P."""
+    """Convert a Uniswap-V3 tick index to √P."""
     return 1.0001 ** (tick / 2)
 
 
@@ -38,7 +34,7 @@ def _group_concat(frames):
 
 
 def _build_fee_table(swap_paths: list[str]) -> pd.DataFrame:
-    """Parse raw Swap CSVs and return a **minute‑level** fee grid.
+    """Parse raw Swap CSVs and return a **minute-level** fee grid.
 
     Columns returned: fee0, fee1, liquidity_pool, tick_close
     Index: pandas.DatetimeIndex rounded to minute.
@@ -57,14 +53,14 @@ def _build_fee_table(swap_paths: list[str]) -> pd.DataFrame:
 
         df.dropna(subset=["amount0", "amount1", "liquidity"], inplace=True)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        # swap amounts can be +/‑; fee is on *notional* traded
+        # swap amounts can be +/-; fee is on *notional* traded
         df["fee0"] = df["amount0"].abs() * POOL_FEE_TIER
         df["fee1"] = df["amount1"].abs() * POOL_FEE_TIER
         dfs.append(df[["timestamp", "fee0", "fee1", "liquidity", "tick"]])
 
     raw = pd.concat(dfs, ignore_index=True)
 
-    # resample to 1‑minute grid (to match env.decision_grid)
+    # resample to 1-minute grid (to match env.decision_grid)
     fee_grid = (raw
                 .set_index("timestamp")
                 .resample("1min")
@@ -78,18 +74,10 @@ def _build_fee_table(swap_paths: list[str]) -> pd.DataFrame:
     fee_grid.fillna({"fee0": 0.0, "fee1": 0.0, "liquidity_pool": np.nan}, inplace=True)
     return fee_grid
 
-################################################
-# Environment
-################################################
-
-
 class UniswapV3LPGymEnv(gym.Env):
 
     metadata = {"render.modes": ["human"]}
 
-    ################################################
-    # Construction / I‑O
-    ################################################
     def __init__(self, config: Config | None = None, feat_num: int = 19):
         super().__init__()
         self.config = config or Config()
@@ -105,7 +93,7 @@ class UniswapV3LPGymEnv(gym.Env):
         self.x_prev = 0.0      # token0 inventory *after* last step
         self.y_prev = 0.0      # token1 inventory *after* last step
 
-        # one‑time loads
+        # one-time loads
         self._load_data()
         self._build_decision_grid()
 
@@ -121,12 +109,9 @@ class UniswapV3LPGymEnv(gym.Env):
 
         self.idx = 0  # pointer on decision_grid
 
-    ################################################
-    # Data loaders
-    ################################################
     def _load_data(self):
-        """Load prices, gas stats, *and* the minute‑level fee grid."""
-        # 1) ETH‑USDC prices (minute open)
+        """Load prices, gas stats, *and* the minute-level fee grid."""
+        # 1) ETH-USDC prices (minute open)
         cols = ["open_time", "open"]
         px = pd.read_csv(ETH_USDC_PRICE_PATH, usecols=cols)
         px["open_time"] = pd.to_datetime(px["open_time"])
@@ -137,7 +122,6 @@ class UniswapV3LPGymEnv(gym.Env):
         lp["timestamp"] = pd.to_datetime(lp["timestamp"], unit="s")
         self.lp_span = lp.set_index("timestamp")
 
-        # 3) gas‑fee tables per event_type
         fee_frames: dict[str, list[pd.DataFrame]] = {}
         for path in glob.glob(f"{UNISWAP_POOL_EVENTS_PATH}/uniswap_lp_data_*.csv"):
             df = pd.read_csv(path, usecols=["timestamp", "event_type", "gas_eth"])
@@ -149,12 +133,11 @@ class UniswapV3LPGymEnv(gym.Env):
             g = _group_concat(lst).sort_values("timestamp")
             self.gas_fee[evt] = g.set_index("timestamp")
 
-        # 4) minute‑level pool fee grid
+        # 4) minute-level pool fee grid
         fee_tbl_path = Path(FEE_TABLE_PATH)
         if fee_tbl_path.exists():
             self.fee_grid = pd.read_parquet(fee_tbl_path)
         else:
-            # build once from Swap CSVs then save → fast subsequent loads
             swap_paths = glob.glob(f"{UNISWAP_POOL_EVENTS_PATH}/uniswap_lp_data_*.csv")
             self.fee_grid = _build_fee_table(swap_paths)
             fee_tbl_path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,9 +148,6 @@ class UniswapV3LPGymEnv(gym.Env):
         end = self.lp_span.index.max()
         self.decision_grid = pd.date_range(start=start, end=end, freq="1min")
 
-    ################################################
-    # Low‑level helpers
-    ################################################
     def _eth_price(self, ts: pd.Timestamp) -> float:
         if ts in self.eth_px.index:
             return float(self.eth_px.loc[ts, "open"])
@@ -212,9 +192,6 @@ class UniswapV3LPGymEnv(gym.Env):
         out[-1] = 1.0  # bias term
         return out
 
-    ################################################
-    # RL API
-    ################################################
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.idx = 0
@@ -273,9 +250,6 @@ class UniswapV3LPGymEnv(gym.Env):
         obs = self._features(self.decision_grid[self.idx]) if not done else None
         return obs, reward, done, False, {}
 
-    ################################################
-    # Misc
-    ################################################
     def render(self, mode="human"):
         ts = self.decision_grid[self.idx]
         print(f"{ts} | cumPnL = {self.cumulative_pnl:,.2f}")
