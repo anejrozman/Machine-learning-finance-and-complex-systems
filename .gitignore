@@ -171,4 +171,6 @@ cython_debug/
 .pypirc
 
 # Large files (to be manually imported by the user)
-uniswap_lp_data
+uniswap_lp_data/
+data/uniswap/fee_table.parquet
+logs/monitor.csv
