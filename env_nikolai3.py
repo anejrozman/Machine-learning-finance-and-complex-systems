@@ -10,7 +10,7 @@ from config.env_config import Config
 
 UNISWAP_POOL_EVENTS_PATH = "uniswap_lp_data"
 ETH_USDC_PRICE_PATH = "data/binance/price_data/coinUSDC-price-data/ETHUSDC_20250316.csv"
-UNISWAP_SAMPLE_PATH = "uniswap_lp_data/uniswap_lp_data_1.csv"
+UNISWAP_SAMPLE_PATH = "uniswap_lp_data/merged_uniswap_data_scaled_fixed.csv"
 FEE_TABLE_PATH = "data/uniswap/fee_table.parquet"
 POOL_FEE_TIER = 0.0005
 
@@ -93,11 +93,13 @@ class UniswapV3LPGymEnv(gym.Env):
         self.eth_px = px.set_index("open_time")
 
         lp = pd.read_csv(UNISWAP_SAMPLE_PATH, usecols=["timestamp", "tick"])
-        lp["timestamp"] = pd.to_datetime(lp["timestamp"], unit="s")
+        lp = lp.iloc[1_000_000:] #TODO: remove this line
+        lp["timestamp"] = pd.to_datetime(lp["timestamp"], unit ="s")
         self.lp_span = lp.set_index("timestamp")
 
         # store full LP data for feature extraction
         self.uniswap_lp_data_1 = pd.read_csv(UNISWAP_SAMPLE_PATH)
+        self.uniswap_lp_data_1 = self.uniswap_lp_data_1.iloc[1_000_000:]  #TODO: remove this line
         self.uniswap_lp_data_1["timestamp"] = pd.to_datetime(
             self.uniswap_lp_data_1["timestamp"], unit="s"
         )
@@ -194,14 +196,14 @@ class UniswapV3LPGymEnv(gym.Env):
         swap_df["amount1"] = pd.to_numeric(swap_df["amount1"], errors="coerce")
         features[3] = swap_df["amount0"].abs().sum() + swap_df["amount1"].abs().sum()
 
-        fee_tier = 0.005
 
         def _lp_fee(row):
             dx, dy = row["amount0"], row["amount1"]
+            act_liquidity = float(row["liquidity"])
             if dy > 0:
-                return (fee_tier / (1 - fee_tier)) * dy
+                return POOL_FEE_TIER * dy * self.L / act_liquidity
             if dx > 0:
-                return (fee_tier / (1 - fee_tier)) * dx
+                return POOL_FEE_TIER * dy * self.L / act_liquidity
             return 0.0
 
         swap_df["lp_fee"] = swap_df.apply(_lp_fee, axis=1)
@@ -209,6 +211,15 @@ class UniswapV3LPGymEnv(gym.Env):
 
         period_df["gas_eth"] = pd.to_numeric(period_df["gas_eth"], errors="coerce")
         features[5] = period_df["gas_eth"].mean() if not period_df.empty else 0.0
+        
+        features[6] = self.x_prev
+        features[7] = self.y_prev
+        
+        features[8] = self.L
+        features[9] = self.x_prev*self._eth_price(timestamp) + self.y_prev
+        features[10]=ticks_to_sqrtp(self.tick_l)
+        features[11] = ticks_to_sqrtp(self.tick_u)
+        
 
         return features
 
