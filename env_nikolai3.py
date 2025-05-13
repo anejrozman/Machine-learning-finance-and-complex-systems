@@ -49,8 +49,8 @@ def _build_fee_table(csv_path: str) -> pd.DataFrame:
         raw[col] = pd.to_numeric(raw[col], errors="coerce")
     raw.dropna(subset=["amount0", "amount1", "liquidity"], inplace=True)
 
-    raw["fee0"] = raw["amount0"].abs() * POOL_FEE_TIER
-    raw["fee1"] = raw["amount1"].abs() * POOL_FEE_TIER
+    raw["fee0"] = raw["amount0"].clip(lower=0) * POOL_FEE_TIER
+    raw["fee1"] = raw["amount1"].clip(lower=0) * POOL_FEE_TIER
 
     fee_grid = (
         raw.set_index("timestamp")
@@ -58,7 +58,7 @@ def _build_fee_table(csv_path: str) -> pd.DataFrame:
             .agg({"fee0": "sum",
                   "fee1": "sum",
                   "liquidity": "mean",
-                  "tick": "last"})
+                  "tick": "mean"}) # TODO: think, use last?
             .rename(columns={"liquidity": "liquidity_pool",
                              "tick": "tick_close"})
     )
@@ -103,44 +103,48 @@ class UniswapV3LPGymEnv(gym.Env):
         self.idx = 0
         self.steps_left = 0
 
-    # ------------------------ data loaders ------------------------
     def _load_data(self):
-        # ---------- CEX price  ----------
-        cols = ["open_time", "open"]
-        px = pd.read_csv(ETH_USDC_PRICE_PATH, usecols=cols)
-        px["open_time"] = pd.to_datetime(px["open_time"])
-        self.eth_px = px.set_index("open_time")
 
-        # ---------- Uniswap price‐span (tick-series) ----------
-        lp = pd.read_csv(UNISWAP_SAMPLE_PATH, usecols=["timestamp", "tick"])
-        lp["timestamp"] = pd.to_datetime(lp["timestamp"])
-        self.lp_span = lp.set_index("timestamp")
+        cex_cols = ["open_time", "open"]
+        cex = pd.read_csv(ETH_USDC_PRICE_PATH, usecols=cex_cols)
+        cex["open_time"] = pd.to_datetime(cex["open_time"])        
+        self.eth_px = cex.set_index("open_time")
 
-        # ---------- Full raw DEX data (all event types) ----------
-        self.uniswap_lp_data = pd.read_csv(UNISWAP_SAMPLE_PATH, low_memory=False)
-        self.uniswap_lp_data["timestamp"] = pd.to_datetime(
-            self.uniswap_lp_data["timestamp"]
-        )
+        dex_tick = pd.read_csv(UNISWAP_SAMPLE_PATH, usecols=["timestamp", "tick"])
+        dex_tick["timestamp"] = pd.to_datetime(dex_tick["timestamp"])
+        self.lp_span = dex_tick.set_index("timestamp")
 
-        # ---------- Gas fees per event type ----------
+        # full raw dataframe (all event types) – we'll slice it later
+        dex_raw = pd.read_csv(UNISWAP_SAMPLE_PATH, low_memory=False)
+        dex_raw["timestamp"] = pd.to_datetime(dex_raw["timestamp"])
+        self.uniswap_lp_data = dex_raw
+
+        start = max(self.eth_px.index.min(), self.lp_span.index.min())
+        end   = min(self.eth_px.index.max(), self.lp_span.index.max())
+
+        self.eth_px        = self.eth_px.loc[start:end]
+        self.lp_span       = self.lp_span.loc[start:end]
+        self.uniswap_lp_data = self.uniswap_lp_data[
+            (self.uniswap_lp_data["timestamp"] >= start)
+            & (self.uniswap_lp_data["timestamp"] <= end)
+        ]
+
         fee_frames: dict[str, pd.DataFrame] = {}
         for evt, grp in self.uniswap_lp_data[["timestamp", "event_type", "gas_eth"]].groupby("event_type"):
-            # keep only columns we need and index by timestamp for fast look-ups
             fee_frames[evt] = (
-                grp.assign(timestamp=lambda df: pd.to_datetime(df["timestamp"]))
-                .set_index("timestamp")
+                grp.set_index("timestamp")
                 .sort_index()
             )
         self.gas_fee = fee_frames
 
-        # ---------- 1-minute fee grid ----------
         fee_tbl_path = Path(FEE_TABLE_PATH)
         if fee_tbl_path.exists():
-            self.fee_grid = pd.read_parquet(fee_tbl_path)
+            grid = pd.read_parquet(fee_tbl_path)
         else:
-            self.fee_grid = _build_fee_table(UNISWAP_SAMPLE_PATH)
+            grid = _build_fee_table(UNISWAP_SAMPLE_PATH)
             fee_tbl_path.parent.mkdir(parents=True, exist_ok=True)
-            self.fee_grid.to_parquet(fee_tbl_path, compression="zstd")
+            grid.to_parquet(fee_tbl_path, compression="zstd")
+        self.fee_grid = grid.loc[start:end]
 
     def _build_decision_grid(self):
         start = self.lp_span.index.min()
@@ -179,23 +183,49 @@ class UniswapV3LPGymEnv(gym.Env):
             return float(row.fee0), float(row.fee1), float(row.liquidity_pool), None
         return float(row.fee0), float(row.fee1), float(row.liquidity_pool), int(tick_close)
 
-    def _accrue_fees(self, ts: pd.Timestamp):
+    # def _accrue_fees(self, ts: pd.Timestamp):
+    #     if not self.active:
+    #         return 0.0, 0.0
+
+    #     fee0_pool, fee1_pool, L_pool, tick_close = self._pool_fees(ts)
+    #     if (tick_close is None) or (tick_close <= self.tick_l) or (tick_close >= self.tick_u):
+    #         return 0.0, 0.0
+
+    #     # not in range → no fees
+    #     if not (self.tick_l < tick_close < self.tick_u):
+    #         return 0.0, 0.0
+    #     if np.isnan(L_pool) or L_pool == 0.0:
+    #         return 0.0, 0.0
+
+    #     L_eff = self.L if self.tick_l < tick_close < self.tick_u else 0.0
+    #     share = L_eff / L_pool
+    #     return share * fee0_pool, share * fee1_pool
+
+    def _accrue_fees(self, ts):
         if not self.active:
             return 0.0, 0.0
 
-        fee0_pool, fee1_pool, L_pool, tick_close = self._pool_fees(ts)
-        if (tick_close is None) or (tick_close <= self.tick_l) or (tick_close >= self.tick_u):
+        # grab the raw swaps for *that* minute only
+        t0 = ts.floor("1min")
+        t1 = t0 + pd.Timedelta(minutes=1)
+        minute_swaps = self.uniswap_lp_data.query(
+            "(event_type == 'Swap') and @t0 <= timestamp < @t1"
+        )
+
+        in_range = minute_swaps[
+            (minute_swaps["tick"] > self.tick_l) & (minute_swaps["tick"] < self.tick_u)
+        ]
+        if in_range.empty:
             return 0.0, 0.0
 
-        # not in range → no fees
-        if not (self.tick_l < tick_close < self.tick_u):
-            return 0.0, 0.0
-        if np.isnan(L_pool) or L_pool == 0.0:
-            return 0.0, 0.0
+        # fees on the positive leg only
+        fee0 = (in_range["amount0"].clip(lower=0) * POOL_FEE_TIER).sum()
+        fee1 = (in_range["amount1"].clip(lower=0) * POOL_FEE_TIER).sum()
 
-        L_eff = self.L if self.tick_l < tick_close < self.tick_u else 0.0
-        share = L_eff / L_pool
-        return share * fee0_pool, share * fee1_pool
+        L_pool = in_range["liquidity"].mean()
+        share  = min(self.L / L_pool, 1.0) if L_pool > 0 else 0.0
+        return share * fee0, share * fee1
+
 
     # ------------------------ feature engineering ------------------------
     def form_observable_features(
