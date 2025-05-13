@@ -103,7 +103,7 @@ class UniswapV3LPGymEnv(gym.Env):
 
         self.action_space = spaces.Box(
             low=np.array([0.0, 0.0],  dtype=np.float32),
-            high=np.array([1.0, 10.0], dtype=np.float32),
+            high=np.array([1.0, 5.0], dtype=np.float32),
             dtype=np.float32,
         )
         self.observation_space = spaces.Box(
@@ -172,15 +172,14 @@ class UniswapV3LPGymEnv(gym.Env):
 
     def _gas_cost(self, evt: str, ts) -> float:
         df = self.gas_fee.get(evt)
-        if df is None or ts not in self.eth_px.index:
-            print("emoty gas fee")
-            return 0.001
+        if df is None:
+            print("Warning: gas fee not available for event type:", evt)
+            return 0.0
         last20 = df.loc[:ts].tail(20)
         if last20.empty:
-            print("last20 empty")
-            return 0.001
-        print(f"Gas cost for {evt} at {ts}: {float(last20["gas_eth"].mean() * self._eth_price(ts))}")
-        print(f"Components: {last20['gas_eth'].mean()}, {self._eth_price(ts)}")
+            print("Warning: gas fee not available for event type:", evt)
+            return 0.0
+
         return float(last20["gas_eth"].mean() * self._eth_price(ts))
     
     def _dex_tick(self, ts: pd.Timestamp) -> int:
@@ -355,8 +354,8 @@ class UniswapV3LPGymEnv(gym.Env):
         p_cex      = self._eth_price(ts)          # USDC per ETH
         curr_tick  = self._dex_tick(ts)
 
-        tick_l     = curr_tick - width
-        tick_u     = curr_tick + width
+        tick_l     = curr_tick - 10 * width
+        tick_u     = curr_tick + 10 * width
 
         sqrt_pl    = ticks_to_sqrtp(tick_l)
         sqrt_pu    = ticks_to_sqrtp(tick_u)
@@ -367,7 +366,7 @@ class UniswapV3LPGymEnv(gym.Env):
         self.y_prev += dy_fee
         # print(self.active, act, f"dx_fee = {dx_fee}, dy_fee = {dy_fee}", "FEE ACCRUED", p * dx_fee + dy_fee)
         # for this one, use CEX price as a more reliable proxy
-        reward = 1000 * (p_cex * max(dx_fee, 0) + max(dy_fee, 0))
+        reward = (p_cex * max(dx_fee, 0) + max(dy_fee, 0))
 
         if not self.active and engage == 1:
             # TODO: revisit
