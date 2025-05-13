@@ -8,7 +8,6 @@ import pandas as pd
 
 from config.env_config import Config
 
-UNISWAP_POOL_EVENTS_PATH = "uniswap_lp_data"
 ETH_USDC_PRICE_PATH = "data/binance/price_data/coinUSDC-price-data/ETHUSDC_20250316.csv"
 UNISWAP_SAMPLE_PATH = "uniswap_lp_data/sorted_uniswap_data1.csv"
 FEE_TABLE_PATH = "data/uniswap/fee_table.parquet"
@@ -30,34 +29,44 @@ def _group_concat(frames):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _build_fee_table(swap_paths: list[str]) -> pd.DataFrame:
-    dfs = []
-    for p in swap_paths:
-        df = pd.read_csv(
-            p,
-            usecols=["timestamp", "amount0", "amount1", "liquidity", "tick"],
+def _build_fee_table(csv_path: str) -> pd.DataFrame:
+    """
+    Build a 1-minute fee grid from *sorted_uniswap_data1.csv*.
+    Only rows whose event_type == 'Swap' are used.
+    """
+    raw = (
+        pd.read_csv(
+            csv_path,
+            usecols=["timestamp", "event_type",
+                     "amount0", "amount1", "liquidity", "tick"],
             low_memory=False,
         )
-        for col in ("amount0", "amount1", "liquidity"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df.dropna(subset=["amount0", "amount1", "liquidity"], inplace=True)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        df["fee0"] = df["amount0"].abs() * POOL_FEE_TIER
-        df["fee1"] = df["amount1"].abs() * POOL_FEE_TIER
-        dfs.append(df[["timestamp", "fee0", "fee1", "liquidity", "tick"]])
+        .query("event_type == 'Swap'")
+        .assign(timestamp=lambda df: pd.to_datetime(df["timestamp"], unit="s"))
+    )
 
-    raw = pd.concat(dfs, ignore_index=True)
+    for col in ("amount0", "amount1", "liquidity"):
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    raw.dropna(subset=["amount0", "amount1", "liquidity"], inplace=True)
+
+    raw["fee0"] = raw["amount0"].abs() * POOL_FEE_TIER
+    raw["fee1"] = raw["amount1"].abs() * POOL_FEE_TIER
+
     fee_grid = (
         raw.set_index("timestamp")
-        .resample("1min")
-        .agg({"fee0": "sum", "fee1": "sum", "liquidity": "mean", "tick": "last"})
+            .resample("1min")
+            .agg({"fee0": "sum",
+                  "fee1": "sum",
+                  "liquidity": "mean",
+                  "tick": "last"})
+            .rename(columns={"liquidity": "liquidity_pool",
+                             "tick": "tick_close"})
     )
-    fee_grid.rename(
-        columns={"liquidity": "liquidity_pool", "tick": "tick_close"}, inplace=True
-    )
-    fee_grid['liquidity_pool'] = fee_grid['liquidity_pool'].ffill()
-    fee_grid['tick_close']     = fee_grid['tick_close'].ffill()
-    fee_grid.fillna({"fee0": 0.0, "fee1": 0.0, "liquidity_pool": np.nan}, inplace=True)
+
+    # forward–fill pool liquidity & last tick, fill missing fees with 0
+    fee_grid["liquidity_pool"] = fee_grid["liquidity_pool"].ffill()
+    fee_grid["tick_close"]     = fee_grid["tick_close"].ffill()
+    fee_grid.fillna({"fee0": 0.0, "fee1": 0.0}, inplace=True)
     return fee_grid
 
 
@@ -96,40 +105,40 @@ class UniswapV3LPGymEnv(gym.Env):
 
     # ------------------------ data loaders ------------------------
     def _load_data(self):
+        # ---------- CEX price  ----------
         cols = ["open_time", "open"]
         px = pd.read_csv(ETH_USDC_PRICE_PATH, usecols=cols)
         px["open_time"] = pd.to_datetime(px["open_time"])
         self.eth_px = px.set_index("open_time")
 
+        # ---------- Uniswap price‐span (tick-series) ----------
         lp = pd.read_csv(UNISWAP_SAMPLE_PATH, usecols=["timestamp", "tick"])
-        lp = lp.iloc[1_000_000:] #TODO: remove this line
         lp["timestamp"] = pd.to_datetime(lp["timestamp"])
         self.lp_span = lp.set_index("timestamp")
 
-        # store full LP data for feature extraction
-        self.uniswap_lp_data_1 = pd.read_csv(UNISWAP_SAMPLE_PATH)
-        self.uniswap_lp_data_1 = self.uniswap_lp_data_1.iloc[1_000_000:]  #TODO: remove this line
-        self.uniswap_lp_data_1["timestamp"] = pd.to_datetime(
-            self.uniswap_lp_data_1["timestamp"]
+        # ---------- Full raw DEX data (all event types) ----------
+        self.uniswap_lp_data = pd.read_csv(UNISWAP_SAMPLE_PATH, low_memory=False)
+        self.uniswap_lp_data["timestamp"] = pd.to_datetime(
+            self.uniswap_lp_data["timestamp"]
         )
 
-        fee_frames: dict[str, list[pd.DataFrame]] = {}
-        for path in glob.glob(f"{UNISWAP_POOL_EVENTS_PATH}/uniswap_lp_data_*.csv"):
-            df = pd.read_csv(path, usecols=["timestamp", "event_type", "gas_eth"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            for evt, grp in df.groupby("event_type"):
-                fee_frames.setdefault(evt, []).append(grp)
-        self.gas_fee = {
-            evt: _group_concat(lst).sort_values("timestamp").set_index("timestamp")
-            for evt, lst in fee_frames.items()
-        }
+        # ---------- Gas fees per event type ----------
+        fee_frames: dict[str, pd.DataFrame] = {}
+        for evt, grp in self.uniswap_lp_data[["timestamp", "event_type", "gas_eth"]].groupby("event_type"):
+            # keep only columns we need and index by timestamp for fast look-ups
+            fee_frames[evt] = (
+                grp.assign(timestamp=lambda df: pd.to_datetime(df["timestamp"]))
+                .set_index("timestamp")
+                .sort_index()
+            )
+        self.gas_fee = fee_frames
 
+        # ---------- 1-minute fee grid ----------
         fee_tbl_path = Path(FEE_TABLE_PATH)
         if fee_tbl_path.exists():
             self.fee_grid = pd.read_parquet(fee_tbl_path)
         else:
-            swap_paths = glob.glob(f"{UNISWAP_POOL_EVENTS_PATH}/uniswap_lp_data_*.csv")
-            self.fee_grid = _build_fee_table(swap_paths)
+            self.fee_grid = _build_fee_table(UNISWAP_SAMPLE_PATH)
             fee_tbl_path.parent.mkdir(parents=True, exist_ok=True)
             self.fee_grid.to_parquet(fee_tbl_path, compression="zstd")
 
@@ -196,12 +205,11 @@ class UniswapV3LPGymEnv(gym.Env):
         features = np.zeros(self.FEAT_NUM, dtype=np.float32)
 
         period_df = (
-            self.uniswap_lp_data_1
-                .loc[(self.uniswap_lp_data_1["timestamp"] >= beginning)
-                    & (self.uniswap_lp_data_1["timestamp"] <= timestamp)]
-                .copy()                # 👈 guarantees an independent frame
+            self.uniswap_lp_data
+                .loc[(self.uniswap_lp_data["timestamp"] >= beginning)
+                    & (self.uniswap_lp_data["timestamp"] <= timestamp)]
+                .copy()              
         )
-
 
         period_df["sqrtPriceX96"] = pd.to_numeric(
             period_df["sqrtPriceX96"], errors="coerce"
@@ -283,7 +291,7 @@ class UniswapV3LPGymEnv(gym.Env):
         self.x_prev += dx_fee
         self.y_prev += dy_fee
         # print(self.active, act, f"dx_fee = {dx_fee}, dy_fee = {dy_fee}", "FEE ACCRUED", p * dx_fee + dy_fee)
-        reward = 100 * (p * max(dx_fee, 0) + max(dy_fee, 0))
+        reward = 1000 * (p * max(dx_fee, 0) + max(dy_fee, 0))
 
         if not self.active and engage == 1:
             # TODO: revisit
