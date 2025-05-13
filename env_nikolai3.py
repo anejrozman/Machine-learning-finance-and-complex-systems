@@ -9,25 +9,35 @@ import pandas as pd
 from config.env_config import Config
 
 ETH_USDC_PRICE_PATH = "data/binance/price_data/coinUSDC-price-data/ETHUSDC_20250316.csv"
-UNISWAP_SAMPLE_PATH = "uniswap_lp_data/sorted_uniswap_data1.csv"
+UNISWAP_SAMPLE_PATH = "uniswap_lp_data/sorted_uniswap_data1_truncated.csv"
 FEE_TABLE_PATH = "data/uniswap/fee_table.parquet"
 POOL_FEE_TIER = 0.0005
+DECIMALS_TOKEN0, DECIMALS_TOKEN1 = 6, 18          # USDC / WETH
+DEC_FACTOR = 10 ** (DECIMALS_TOKEN1 - DECIMALS_TOKEN0)  # 1_000_000_000_000
+
 LOG_1P0001 = np.log(1.0001)
+
+def tick_to_price(tick: int | float) -> float:
+    """Tick → dollar price (USDC per ETH)."""
+    return DEC_FACTOR / (1.0001 ** tick)
+
+def price_usd_to_tick(price_usd: float) -> int:
+    """Dollar price (USDC per ETH) → nearest Uniswap tick."""
+    return int(round(np.log(DEC_FACTOR / price_usd) / LOG_1P0001))
+
+def ticks_to_sqrtp(tick: int) -> float:
+    """Uniswap √-price corresponding to *token1/token0* (WETH/USDC)."""
+    return 1.0001 ** (tick / 2)           # unchanged – this is √P_pool
 
 def price_to_tick(price: float) -> int:
     """
-    Convert a pool price (P) into the closest Uniswap tick.
-    P = (1.0001) ** tick
+    Convert a *dollar* price (USDC per ETH) into the closest Uniswap tick.
+    The pool stores P_pool = 1.0001**tick = DEC_FACTOR / price.
     """
-    return int(round(np.log(price) / LOG_1P0001))
+    return int(round(np.log(DEC_FACTOR / price) / LOG_1P0001))
 
-def ticks_to_sqrtp(tick: int) -> float:
-    return 1.0001 ** (tick / 2)
-
-
-def _group_concat(frames):
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
+# def _group_concat(frames):
+#     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 def _build_fee_table(csv_path: str) -> pd.DataFrame:
     """
@@ -163,11 +173,43 @@ class UniswapV3LPGymEnv(gym.Env):
     def _gas_cost(self, evt: str, ts) -> float:
         df = self.gas_fee.get(evt)
         if df is None or ts not in self.eth_px.index:
-            return 0.0
+            print("emoty gas fee")
+            return 0.001
         last20 = df.loc[:ts].tail(20)
         if last20.empty:
-            return 0.0
+            print("last20 empty")
+            return 0.001
+        print(f"Gas cost for {evt} at {ts}: {float(last20["gas_eth"].mean() * self._eth_price(ts))}")
+        print(f"Components: {last20['gas_eth'].mean()}, {self._eth_price(ts)}")
         return float(last20["gas_eth"].mean() * self._eth_price(ts))
+    
+    def _dex_tick(self, ts: pd.Timestamp) -> int:
+        """
+        Get the average tick from Swap events at or before *ts*.
+        If multiple swaps happen at *ts*, their ticks are averaged.
+        """
+        # Slice only Swap events with valid ticks
+        swap_df = self.uniswap_lp_data
+        if "event_type" in swap_df.columns:
+            swap_df = swap_df[swap_df["event_type"] == "Swap"]
+
+        swap_df = swap_df.dropna(subset=["tick"])
+        swap_df = swap_df.set_index("timestamp").sort_index()
+
+        # Exact match: take average of all swaps at this second
+        if ts in swap_df.index:
+            ticks_at_ts = swap_df.loc[ts, "tick"]
+            if isinstance(ticks_at_ts, pd.Series):
+                return int(np.nanmean(ticks_at_ts))
+            return int(ticks_at_ts)
+
+        # Otherwise: fallback to most recent tick before ts
+        pos = swap_df.index.searchsorted(ts, side="right") - 1
+        if pos < 0:
+            raise ValueError(f"No swap tick data available before {ts}.")
+        tick = swap_df.iloc[pos]["tick"]
+        return int(tick)
+
 
     # ------------------------ pool fee helpers ------------------------
     def _pool_fees(self, ts):
@@ -310,52 +352,58 @@ class UniswapV3LPGymEnv(gym.Env):
         engage = 1 if action[0] >= 0.5 else 0
         width  = int(round(np.clip(action[1], 0, 10)))
 
-        p          = self._eth_price(ts)
-        curr_tick  = price_to_tick(p)
+        p_cex      = self._eth_price(ts)          # USDC per ETH
+        curr_tick  = self._dex_tick(ts)
 
-        tick_l     = curr_tick - 100*width
-        tick_u     = curr_tick + 100*width
+        tick_l     = curr_tick - width
+        tick_u     = curr_tick + width
 
-        p = self._eth_price(ts)
-        dx_fee, dy_fee = self._accrue_fees(ts)
+        sqrt_pl    = ticks_to_sqrtp(tick_l)
+        sqrt_pu    = ticks_to_sqrtp(tick_u)
+        sqrt_pc    = ticks_to_sqrtp(curr_tick)
+
+        dx_fee, dy_fee = self._accrue_fees(ts)    # token0 = ETH, token1 = USDC
         self.x_prev += dx_fee
         self.y_prev += dy_fee
         # print(self.active, act, f"dx_fee = {dx_fee}, dy_fee = {dy_fee}", "FEE ACCRUED", p * dx_fee + dy_fee)
-        reward = 1000 * (p * max(dx_fee, 0) + max(dy_fee, 0))
+        # for this one, use CEX price as a more reliable proxy
+        reward = 1000 * (p_cex * max(dx_fee, 0) + max(dy_fee, 0))
 
         if not self.active and engage == 1:
             # TODO: revisit
             self.tick_l, self.tick_u = tick_l, tick_u
-            sqrt_pl, sqrt_pu = ticks_to_sqrtp(tick_l), ticks_to_sqrtp(tick_u)
-            sqrt_pc = np.sqrt(p)
-            # TODO: revisit
-            if not (sqrt_pl < sqrt_pc < sqrt_pu):
-                # TODO: revisit
-                sqrt_pc = min(max(sqrt_pc, sqrt_pl * 1.0000001), sqrt_pu / 1.0000001)
+
             denom = sqrt_pc * (sqrt_pu - sqrt_pc) + sqrt_pl * (sqrt_pc - sqrt_pl)
             self.L = max(0.0, self.initial_wealth / denom)
+
             x0 = self.L * (sqrt_pu - sqrt_pc) / (sqrt_pc * sqrt_pu)
             y0 = self.L * (sqrt_pc - sqrt_pl)
             self.x_prev, self.y_prev = x0, y0
+
             self.active = True
             reward -= self._gas_cost("Mint", ts)
 
         elif self.active and engage == 0:
-            reward -= self._gas_cost("Burn", ts) + self._gas_cost("Collect", ts)
+            reward -= self._gas_cost("Burn", ts)
+            reward -= self._gas_cost("Collect", ts)
             self.active = False
             self.L = 0.0
 
         elif self.active:
-            sqrt_pl, sqrt_pu = ticks_to_sqrtp(self.tick_l), ticks_to_sqrtp(self.tick_u)
-            sqrt_pc = np.sqrt(p)
+            sqrt_pl = ticks_to_sqrtp(self.tick_l)
+            sqrt_pu = ticks_to_sqrtp(self.tick_u)
+            sqrt_pc = ticks_to_sqrtp(curr_tick)
+
             if sqrt_pc <= sqrt_pl:
                 xt, yt = self.L * (sqrt_pu - sqrt_pl) / (sqrt_pl * sqrt_pu), 0.0
+
             elif sqrt_pc < sqrt_pu:
                 xt = self.L * (sqrt_pu - sqrt_pc) / (sqrt_pc * sqrt_pu)
                 yt = self.L * (sqrt_pc - sqrt_pl)
             else:
                 xt, yt = 0.0, self.L * (sqrt_pu - sqrt_pl)
-            reward += p * (xt - self.x_prev) + (yt - self.y_prev)
+
+            reward += p_cex * (xt - self.x_prev) + (yt - self.y_prev)
             self.x_prev, self.y_prev = xt, yt
 
         self.cumulative_pnl += reward
